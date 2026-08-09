@@ -1,10 +1,10 @@
 # Platform Notes
 
-Behaviors, failure modes, and traps for each supported platform. These are the things that cost hours when nobody writes them down — collected here from building and operating these integrations in production.
+Behaviors, failure modes, and traps for each supported platform. These are the things that cost hours when nobody writes them down, collected here from building and operating these integrations in production.
 
 ---
 
-## Neos — creates an intake
+## Neos | creates an intake
 
 **Auth:** bearer token obtained from the login endpoint, cached until it nears expiry rather than requested fresh on every submission. Without caching, every lead pays for an extra round trip and generates avoidable auth traffic against a partner API.
 
@@ -22,7 +22,7 @@ Neos requires a real partner API onboarding path: staging credentials, then perm
 
 ---
 
-## Lead Docket — creates an opportunity
+## Lead Docket | creates an opportunity
 
 **Auth:** a static security key appended to the endpoint rather than a token exchange. Simpler, no refresh lifecycle, no caching layer, but it means a long-lived secret sits in site configuration and key rotation is a manual operation.
 
@@ -40,7 +40,7 @@ Opportunity records carry case type and source fields that each firm configures 
 
 ---
 
-## HubSpot — creates a contact
+## HubSpot | creates a contact
 
 **Auth:** private app token, scoped to the client's portal.
 

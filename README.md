@@ -1,99 +1,181 @@
-# Platform Notes
+# Form to CRM Bridge
 
-Behaviors, failure modes, and traps for each supported platform. These are the things that cost hours when nobody writes them down — collected here from building and operating these integrations in production.
+A solution that forwards website form submissions straight into a CRM. Gravity Forms and Elementor Pro submissions are normalized, mapped to the target platform's API format, and posted to create the record: an intake in Neos, an opportunity in Lead Docket, a contact in HubSpot.
 
----
-
-## Neos — creates an intake
-
-**Auth:** bearer token obtained from the login endpoint, cached until it nears expiry rather than requested fresh on every submission. Without caching, every lead pays for an extra round trip and generates avoidable auth traffic against a partner API.
-
-**Token refresh:** a 401 triggers exactly one refresh and one retry. A second 401 is a hard failure, it means a revoked or misconfigured credential, which needs an operator, not a retry loop.
-
-### The trap: per-field permissions fail quietly
-
-Write permissions are scoped per tenant and **do not fail loudly at onboarding**. The connection can authenticate perfectly while an individual field write returns 403. In practice this showed up as a 403 on email fields specifically, caused by missing tenant permissions — nothing about the token or the connection looked wrong.
-
-**Control:** when onboarding a new tenant, explicitly verify write permission on *each mapped field*, not just that the token works. The adapter logs a specific hint when it sees a 403, because the raw error doesn't explain itself.
-
-### Lead time
-
-Neos requires a real partner API onboarding path: staging credentials, then permission grants, then production. This is the longest lead time of the supported platforms and should be started early on any new client using it.
+Live demo: **https://bridge-demo.msschermer.us** (submit a sample form and watch the normalization and per platform payloads happen in real time)
 
 ---
 
-## Lead Docket — creates an opportunity
+## Why this exists
 
-**Auth:** a static security key appended to the endpoint rather than a token exchange. Simpler, no refresh lifecycle, no caching layer, but it means a long-lived secret sits in site configuration and key rotation is a manual operation.
+Websites collect leads through forms. Those leads have to reach the business CRM / case management system, and every firm uses a different one. The naive approach is to build an integration per firm, which means the expensive part, figuring out a platform's auth, field mapping, and failure semantics, gets re-solved on every project.
 
-**Format:** the endpoint accepts form-urlencoded, not JSON.
+I built this integration, then tailored it several times for different platforms, and the rebuilds made the real shape of the problem obvious: roughly 80% of each one was identical, and the identical part was being copy pasted. This repo is that pattern refactored properly. One shared core, with each platform reduced to a thin adapter.
 
-### The trap: HTTP 200 does not mean accepted
-
-Lead Docket reports application-level success in the response body, separately from the HTTP status. A **200 response with `success: false`** is a rejection, not a delivery.
-
-**Control:** the adapter interprets the body after the transport reports HTTP success, and treats a false success flag as a hard failure with the platform's own reason logged. It is not retried, retrying will not change a rejected payload.
-
-### Mapping is more client-specific here
-
-Opportunity records carry case type and source fields that each firm configures itself. Expect a mapping review per install rather than copying the previous one.
+The core value is not any one integration. It is that the skeleton is shared, so the expensive work gets solved **once per CRM** rather than once per client. Every later client on a supported platform becomes an install and configure job rather than a build.
 
 ---
 
-## HubSpot — creates a contact
+## Architecture
 
-**Auth:** private app token, scoped to the client's portal.
+The design boundary is the whole point: separate what is identical everywhere from what genuinely differs per platform.
 
-### The trap: silent field drops
+### Shared, written once: `core/`
 
-HubSpot will accept a submission and **discard properties it does not recognize without raising an error**. A 200 response does not mean every field landed. This is the single most misleading behavior across all supported platforms, because everything about the response says success.
+| File | Responsibility |
+|---|---|
+| `capture.php` | Normalizes Gravity Forms and Elementor Pro hooks into one internal payload shape. Nothing downstream knows which form plugin fired. Supporting another form plugin later touches only this file. |
+| `mapper.php` | Applies alias resolution to produce a canonical field set from whatever keys the form builder produced. |
+| `transport.php` | Performs the POST, applies retry policy, interprets HTTP level outcomes. |
+| `logger.php` | Records the outcome of every submission, including the recoverable payload on failure. |
 
-**Control:** the adapter optionally reads the created contact back and logs any mapped property that did not persist, by name. Validation has to confirm the *contents* of the created record, not just the status code.
+### Per adapter, the actual work: `adapters/`
+
+Each adapter supplies only three things:
+
+* **Authentication** acquisition and lifecycle.
+* **Field mapping** into that platform's request body, including required fields and its own validation quirks.
+* **Response interpretation**, meaning what counts as success, what is worth retrying, and what is a hard failure.
+
+Everything else is inherited.
+
+---
+
+## The adapter contract
+
+An adapter registers itself and implements two functions:
 
 ```php
-define('FCB_HUBSPOT_VERIFY_WRITE', true);   // on by default
+add_filter('fcb_register_adapters', function (array $adapters): array {
+    $adapters[] = [
+        'id'            => 'myplatform',
+        'is_configured' => 'fcb_myplatform_is_configured', // bool
+        'send'          => 'fcb_myplatform_send',          // bool
+    ];
+    return $adapters;
+});
 ```
 
-### The trap: enum and picklist formatting
+`send()` receives the canonical `$fields` array and a `$context` array (form name, page URL, UTM parameters), builds the platform's payload, hands it to `fcb_post_with_retry()`, and reports the outcome.
 
-Picklist properties must match HubSpot's **internal values** exactly, not the display labels shown in the UI. This is the most common source of mapping bugs on this platform, and it fails silently in exactly the way described above.
+`adapters/webhook.php` is the smallest complete example. Start there when adding a platform.
 
-### Custom properties must already exist
+### Adding a platform
 
-A property that hasn't been created in the portal cannot be written. Sending an undefined property is the usual root cause behind a silent drop.
+To support a new CRM, an engineer writes an auth handler for that platform's scheme, a field map to its request body, response interpretation rules, and a short note on its quirks in [PLATFORM-NOTES.md](PLATFORM-NOTES.md). Form capture, transport, retries, logging, and configuration are inherited.
 
-### Duplicates
+The practical result is that "can you support platform X?" becomes a scoping question with a predictable estimate instead of an open ended one.
 
-HubSpot rejects a contact whose email already exists with a 409. This is expected behavior rather than an error to retry, and the adapter logs it as such.
-
----
-
-## Platforms in a different shape
-
-Not every CRM fits the adapter model cheaply. Adapters are inexpensive when a platform's auth resembles something already built. A platform requiring **OAuth 2.0 authorization-code flow plus a background queue architecture** is a fundamentally different shape, the auth is interactive, tokens require refresh storage, and submissions can't be delivered synchronously inside a form hook.
-
-Platforms in that category should be scoped as their own piece of work rather than folded into an adapter estimate. Naming that distinction up front is what keeps the effort model honest.
+One caveat on estimating. Adapters are only cheap when the platform's auth model resembles something already built. A platform requiring OAuth 2.0 authorization code flow plus a background queue is a different shape entirely and should be planned as its own piece of work rather than folded into an adapter estimate.
 
 ---
 
-## Effort model
+## Reliability
 
-This is the part that matters most for planning.
+Behavior is consistent across every adapter, because it lives in the core.
 
-| Work | Cost | Frequency |
-|---|---|---|
-| Shared core | Built once | Once, total |
-| New platform adapter | Auth + mapping + error semantics | Once per CRM |
-| Additional client on a supported platform | Credentials, field map review, form allowlist, validation | Once per client |
+**Retry on transient failures.** Network timeouts, 429 rate limiting, and 5xx responses, with exponential backoff (2s, 4s, 8s, 16s) and a bounded attempt count.
 
-Each new platform costs roughly the same bounded amount, and each new client on a supported platform costs very little. The suite gets cheaper to operate as it grows rather than more expensive, which is the entire argument for the shared-core design.
+**Do not retry hard failures.** Validation and auth errors in the 4xx range. Retrying a malformed payload just multiplies the failure, so these are logged for human attention instead.
+
+**Auth handling.** A 401 triggers one credential refresh and one retry, then fails hard. A repeated 401 means a rotated or revoked credential, which needs an operator rather than a retry loop.
+
+**Nothing is silently lost.** A submission that exhausts its attempts is logged with its full payload and error, so the lead is recoverable by hand. The site's existing form notification still fires regardless.
+
+**Nothing can break a form submission.** Every hook is wrapped in `try`/`catch`, and one adapter failing does not prevent the others from delivering.
+
+**Safe by default.** The plugin can be activated with nothing configured. It logs a notice and does nothing.
 
 ---
 
-## Operational open questions
+## Configuration
 
-Honest gaps worth naming rather than pretending are solved:
+All credentials live in `wp-config.php`, never in the plugin. An adapter activates itself when its own settings are present.
 
-**Credential storage.** Credentials currently live in per-site configuration. That's simple and keeps secrets out of the codebase, but it means rotation is a per-site operation and there's no central inventory of which site holds which key.
+```php
+// Neos
+define('FCB_NEOS_INTEGRATION_ID',   '...');
+define('FCB_NEOS_API_KEY',          '...');
+define('FCB_NEOS_COMPANY_ID',       '...');
+define('FCB_NEOS_SUBSCRIPTION_KEY', '...');
+define('FCB_NEOS_ENV',       'staging');   // or 'production'
+define('FCB_NEOS_CASE_TYPE', 'EXAMPLE CASE TYPE');
 
-**Centralized monitoring.** Per-site logs answer "did this lead make it?" Nothing currently answers "which of our sites had failed submissions this week?" in one view. That's the natural next build.
+// Lead Docket
+define('FCB_LD_ENDPOINT',     'https://YOURFIRM.leaddocket.com/opportunities/form/1');
+define('FCB_LD_SECURITY_KEY', '...');
+
+// HubSpot
+define('FCB_HUBSPOT_TOKEN', '...');
+
+// Generic webhook, also the easiest way to test
+define('FCB_WEBHOOK_URL', 'https://webhook.site/your-id');
+```
+
+Submissions are opt in per form rather than global. A site with a newsletter signup and a case evaluation form should only be sending the latter:
+
+```php
+define('FCB_GF_INCLUDE_IDS', '1,3');                 // only these form IDs
+define('FCB_ELEMENTOR_INCLUDE_FORMS', 'Case Evaluation');
+// or the inverse:
+define('FCB_GF_EXCLUDE_IDS', '2');
+define('FCB_ELEMENTOR_EXCLUDE_FORMS', 'Newsletter');
+```
+
+Optional debug output (full payloads, off by default):
+
+```php
+define('FCB_DEBUG', true);
+```
+
+### Form field keys
+
+Set the field's **Admin Field Label** (Gravity Forms) or **field ID** (Elementor Pro) to one of the canonical keys: `fullname` (or `firstname` plus `lastname`), `email`, `phone`, `message`, `dateofincident`, `city`, `state`, `zip`.
+
+Common variations are resolved automatically. Keys like `your-email`, `tel`, `comments`, and `zipcode` all map correctly without configuration.
+
+---
+
+## Installation
+
+1. Copy the plugin folder to `wp-content/plugins/`, or upload a zip of it through **Plugins → Add New → Upload**.
+2. Activate it.
+3. Add the relevant defines to `wp-config.php`.
+4. Set the form field keys as above.
+5. Validate before going live (below).
+
+---
+
+## Validation before a site goes live
+
+Verifying the HTTP status code is not sufficient on any of these platforms.
+
+* **Use staging credentials first** where the platform offers them.
+* **Verify the record, not the response.** Open the created intake, opportunity, or contact in the CRM and confirm every mapped field actually populated. This is the specific control for HubSpot's silent field drops and for Neos field level permission failures.
+* **Test each allowed form individually.** Different forms carry different field sets, and it is common for one to map cleanly while another has a gap.
+* **Force a failure.** Submit with a deliberately invalid payload or a revoked credential, then confirm the error is logged and the site's fallback notification still fires.
+* **Confirm no duplicate records** are created when a retry occurs.
+
+---
+
+## Platform notes
+
+Each platform has behaviors that cost hours if nobody wrote them down. They are documented in **[PLATFORM-NOTES.md](PLATFORM-NOTES.md)**, covering auth models, known failure modes, and the specific traps for each.
+
+---
+
+## Repository layout
+
+```text
+form-crm-bridge.php     # bootstrap: loads core, registers adapters
+core/
+  capture.php           # form hooks to normalized payload
+  mapper.php            # alias resolution to canonical fields
+  transport.php         # POST plus retry policy
+  logger.php            # outcome logging
+adapters/
+  neos.php              # bearer token, creates an intake
+  leaddocket.php        # security key, creates an opportunity
+  hubspot.php           # private app token, creates a contact
+  webhook.php           # generic endpoint, reference adapter and test target
+```
